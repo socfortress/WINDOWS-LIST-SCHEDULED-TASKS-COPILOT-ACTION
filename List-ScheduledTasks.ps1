@@ -1,121 +1,144 @@
 [CmdletBinding()]
 param(
   [string]$LogPath = "$env:TEMP\ListScheduledTasks-script.log",
-  [string]$ARLog = 'C:\Program Files (x86)\ossec-agent\active-response\active-responses.log'
+  [string]$ARLog   = 'C:\Program Files (x86)\ossec-agent\active-response\active-responses.log'
 )
 
 $ErrorActionPreference = 'Stop'
-$HostName = $env:COMPUTERNAME
-$LogMaxKB = 100
-$LogKeep = 5
-$runStart = Get-Date
+$HostName  = $env:COMPUTERNAME
+$LogMaxKB  = 100
+$LogKeep   = 5
+$runStart  = Get-Date
 
 function Write-Log {
   param([string]$Message,[ValidateSet('INFO','WARN','ERROR','DEBUG')]$Level='INFO')
-  $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')
-  $line = "[$ts][$Level] $Message"
-  switch ($Level) {
-    'ERROR' { Write-Host $line -ForegroundColor Red }
-    'WARN'  { Write-Host $line -ForegroundColor Yellow }
-    'DEBUG' { if ($PSCmdlet.MyInvocation.BoundParameters.ContainsKey('Verbose')) { Write-Verbose $line } }
-    default { Write-Host $line }
+  $ts=(Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')
+  $line="[$ts][$Level] $Message"
+  switch($Level){
+    'ERROR'{Write-Host $line -ForegroundColor Red}
+    'WARN' {Write-Host $line -ForegroundColor Yellow}
+    'DEBUG'{if($PSCmdlet.MyInvocation.BoundParameters.ContainsKey('Verbose')){Write-Verbose $line}}
+    default{Write-Host $line}
   }
   Add-Content -Path $LogPath -Value $line
 }
 
 function Rotate-Log {
-  if (Test-Path $LogPath -PathType Leaf) {
-    if ((Get-Item $LogPath).Length/1KB -gt $LogMaxKB) {
-      for ($i = $LogKeep - 1; $i -ge 0; $i--) {
-        $old = "$LogPath.$i"
-        $new = "$LogPath." + ($i + 1)
-        if (Test-Path $old) { Rename-Item $old $new -Force }
+  if(Test-Path $LogPath -PathType Leaf){
+    if((Get-Item $LogPath).Length/1KB -gt $LogMaxKB){
+      for($i=$LogKeep-1;$i -ge 0;$i--){
+        $old="$LogPath.$i";$new="$LogPath."+($i+1)
+        if(Test-Path $old){Rename-Item $old $new -Force}
       }
       Rename-Item $LogPath "$LogPath.1" -Force
     }
   }
 }
 
-function To-ISO8601($dt) {
-  if ($dt -and $dt -is [datetime] -and $dt.Year -gt 1900) {
-    return $dt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-  } else {
-    return $null
-  }
+function To-ISO8601($dt){
+  if($dt -and $dt -is [datetime] -and $dt.Year -gt 1900){
+    return $dt.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  } else { return $null }
 }
 
 Rotate-Log
-
-try {
-  if (Test-Path $ARLog) {
-    Remove-Item -Path $ARLog -Force -ErrorAction Stop
-  }
-  New-Item -Path $ARLog -ItemType File -Force | Out-Null
-  Write-Log "Active response log cleared for fresh run."
-} catch {
-  Write-Log "Failed to clear ${ARLog}: $($_.Exception.Message)" 'WARN'
-}
-
 Write-Log "=== SCRIPT START : List Scheduled Tasks ==="
 
-try {
-  $taskList = Get-ScheduledTask | ForEach-Object {
-    $task = $_
+try{
+  $tasks = Get-ScheduledTask
+  $lines = @()
+
+  # Build lookup of recent run events (Event ID 201: Task completed)
+  $filter = @{
+    LogName   = 'Microsoft-Windows-TaskScheduler/Operational'
+    Id        = 201
+    StartTime = (Get-Date).AddDays(-7)
+  }
+  $events = Get-WinEvent -FilterHashtable $filter -MaxEvents 200 -ErrorAction SilentlyContinue
+
+  # Summary line
+  $lines += ([pscustomobject]@{
+    timestamp      = (Get-Date).ToString('o')
+    host           = $HostName
+    action         = 'list_scheduled_tasks_summary'
+    task_count     = ($tasks | Measure-Object).Count
+    copilot_action = $true
+  } | ConvertTo-Json -Compress -Depth 3)
+
+  foreach($task in $tasks){
     $info = Get-ScheduledTaskInfo -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction SilentlyContinue
-    $history = @()
-    try {
-      $filter = @{
-        LogName = 'Microsoft-Windows-TaskScheduler/Operational'
-        Id = 201
-        StartTime = (Get-Date).AddDays(-7)
-      }
-      $events = Get-WinEvent -FilterHashtable $filter -MaxEvents 200 -ErrorAction SilentlyContinue |
-        Where-Object { $_.Properties[0].Value -eq ($task.TaskPath + $task.TaskName) } |
-        Sort-Object TimeCreated -Descending | Select-Object -First 5
-      foreach ($ev in $events) {
-        $time = To-ISO8601 $ev.TimeCreated
-        $result = $ev.Properties[1].Value
-        $history += @{ time = $time; result = $result }
-      }
-    } catch { }
-    [PSCustomObject]@{
-      task_name = $task.TaskName
-      path = $task.TaskPath
-      state = $info.State
-      last_run_time = To-ISO8601 $info.LastRunTime
-      next_run_time = To-ISO8601 $info.NextRunTime
+
+    # Task line (no nested arrays; triggers/actions are joined)
+    $lines += ([pscustomobject]@{
+      timestamp        = (Get-Date).ToString('o')
+      host             = $HostName
+      action           = 'list_scheduled_tasks'
+      task_name        = $task.TaskName
+      path             = $task.TaskPath
+      state            = $info.State
+      last_run_time    = To-ISO8601 $info.LastRunTime
+      next_run_time    = To-ISO8601 $info.NextRunTime
       last_task_result = $info.LastTaskResult
-      author = $task.Author
-      run_level = $task.Principal.RunLevel
-      triggers = ($task.Triggers | ForEach-Object { $_.TriggerType } | Sort-Object -Unique) -join "; "
-      actions = ($task.Actions | ForEach-Object { $_.Execute }) -join "; "
-      history = $history
+      author           = $task.Author
+      run_level        = $task.Principal.RunLevel
+      triggers         = ($task.Triggers | ForEach-Object { $_.TriggerType } | Sort-Object -Unique) -join '; '
+      actions          = ($task.Actions  | ForEach-Object { $_.Execute }) -join '; '
+      copilot_action   = $true
+    } | ConvertTo-Json -Compress -Depth 4)
+
+    # Up to 5 recent completion events per task as separate NDJSON lines
+    $taskFullName = $task.TaskPath + $task.TaskName
+    $taskEvents = $events | Where-Object { $_.Properties[0].Value -eq $taskFullName } |
+                  Sort-Object TimeCreated -Descending | Select-Object -First 5
+    foreach($ev in $taskEvents){
+      $lines += ([pscustomobject]@{
+        timestamp      = To-ISO8601 $ev.TimeCreated
+        host           = $HostName
+        action         = 'scheduled_task_history'
+        task_name      = $task.TaskName
+        path           = $task.TaskPath
+        result         = $ev.Properties[1].Value
+        copilot_action = $true
+      } | ConvertTo-Json -Compress -Depth 3)
     }
   }
 
-  $results = @{
-    timestamp = (Get-Date).ToString('o')
-    host = $HostName
-    action = "list_scheduled_tasks"
-    scheduled_tasks = $taskList
-    copilot_action = $true
-  }
+  # Write NDJSON atomically with .new fallback
+  $ndjson   = [string]::Join("`n",$lines)
+  $tempFile = "$env:TEMP\arlog.tmp"
+  Set-Content -Path $tempFile -Value $ndjson -Encoding ascii -Force
 
-  $results | ConvertTo-Json -Compress | Out-File -FilePath $ARLog -Encoding ascii -Width 2000
-  Write-Log "Scheduled tasks JSON logged to $ARLog" 'INFO'
-} catch {
+  $recordCount = $lines.Count
+  try{
+    Move-Item -Path $tempFile -Destination $ARLog -Force
+    Write-Log "Wrote $recordCount NDJSON record(s) to $ARLog" 'INFO'
+  }catch{
+    Move-Item -Path $tempFile -Destination "$ARLog.new" -Force
+    Write-Log "ARLog locked; wrote to $($ARLog).new" 'WARN'
+  }
+}
+catch{
   Write-Log $_.Exception.Message 'ERROR'
-  $errorObj = [pscustomobject]@{
-    timestamp = (Get-Date).ToString('o')
-    host = $HostName
-    action = 'list_scheduled_tasks'
-    status = 'error'
-    error = $_.Exception.Message
+  $err=[pscustomobject]@{
+    timestamp      = (Get-Date).ToString('o')
+    host           = $HostName
+    action         = 'list_scheduled_tasks'
+    status         = 'error'
+    error          = $_.Exception.Message
     copilot_action = $true
   }
-  $errorObj | ConvertTo-Json -Compress | Out-File -FilePath $ARLog -Append -Encoding ascii -Width 2000
-} finally {
-  $dur = [int]((Get-Date) - $runStart).TotalSeconds
+  $ndjson = ($err | ConvertTo-Json -Compress -Depth 3)
+  $tempFile="$env:TEMP\arlog.tmp"
+  Set-Content -Path $tempFile -Value $ndjson -Encoding ascii -Force
+  try{
+    Move-Item -Path $tempFile -Destination $ARLog -Force
+    Write-Log "Error JSON written to $ARLog" 'INFO'
+  }catch{
+    Move-Item -Path $tempFile -Destination "$ARLog.new" -Force
+    Write-Log "ARLog locked; wrote error to $($ARLog).new" 'WARN'
+  }
+}
+finally{
+  $dur=[int]((Get-Date)-$runStart).TotalSeconds
   Write-Log "=== SCRIPT END : duration ${dur}s ==="
 }
-
