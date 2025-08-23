@@ -1,5 +1,5 @@
 {
-  "copilot_action_name": "WINDOWS-LIST-SCHEDULED-TASKS-ACTIVERESPONSE",
+  "copilot_action_name": "WINDOWS-LIST-SCHEDULED-TASKS-COPILOT-ACTION",
   "description": "Lists all Windows Scheduled Tasks with key properties (state, author, run level, triggers, actions) and emits NDJSON lines, plus up to 5 recent completion events per task from the Task Scheduler Operational log (last 7 days). Uses atomic overwrite of the Active Response log with .new fallback.",
   "technology": "Windows",
   "icon": "windows",
