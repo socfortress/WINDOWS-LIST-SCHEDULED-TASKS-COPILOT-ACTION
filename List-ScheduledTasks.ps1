@@ -2,7 +2,7 @@
 param(
   [string]$LogPath = "$env:TEMP\ListScheduledTasks-script.log",
   [string]$ARLog   = 'C:\Program Files (x86)\ossec-agent\active-response\active-responses.log',
-  [int]   $MaxTasks = 0   
+  [int]   $MaxTasks = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -43,6 +43,10 @@ function To-ISO8601 {
 
 function New-NdjsonLine {
   param([hashtable]$Data)
+  if (-not $Data.ContainsKey('timestamp'))      { $Data['timestamp'] = (Get-Date).ToUniversalTime().ToString('o') }
+  if (-not $Data.ContainsKey('host'))           { $Data['host'] = $HostName }
+  if (-not $Data.ContainsKey('action'))         { $Data['action'] = 'list_scheduled_tasks' }
+  if (-not $Data.ContainsKey('copilot_action')) { $Data['copilot_action'] = $true }
   return ($Data | ConvertTo-Json -Compress -Depth 7)
 }
 
@@ -73,9 +77,10 @@ Write-Log "=== SCRIPT START : List Scheduled Tasks (host=$HostName) ==="
 
 try{
   Ensure-TaskSchedulerOperationalLog
-
   Write-Log "Loading tasks..." 'INFO'
-  $tasks = Get-ScheduledTask
+  $tasks = @()
+  try { $tasks = Get-ScheduledTask -ErrorAction Stop }
+  catch { Write-Log ("Get-ScheduledTask error: {0}" -f $_.Exception.Message) 'WARN' }
 
   if($MaxTasks -gt 0 -and $tasks.Count -gt $MaxTasks){
     Write-Log ("Capping tasks from {0} to {1}" -f $tasks.Count, $MaxTasks) 'WARN'
@@ -86,7 +91,7 @@ try{
   try{
     $filter = @{
       LogName   = 'Microsoft-Windows-TaskScheduler/Operational'
-      Id        = 201
+      Id        = @(200,201,203)
       StartTime = (Get-Date).AddDays(-7)
     }
     $events = Get-WinEvent -FilterHashtable $filter -ErrorAction SilentlyContinue
@@ -96,21 +101,19 @@ try{
 
   $tsNow = (Get-Date).ToString('o')
   $lines = New-Object System.Collections.ArrayList
+
   [void]$lines.Add( (New-NdjsonLine @{
-    timestamp      = $tsNow
-    host           = $HostName
-    action         = 'list_scheduled_tasks'
-    copilot_action = $true
     item           = 'config'
-    note           = 'operational log: ID=201 last 7 days; up to 5 recent events per task'
+    note           = 'operational log: IDs 200/201/203 last 7 days; up to 5 recent events per task'
   }) )
 
-  # Summary
   [void]$lines.Add( (New-NdjsonLine @{
-    timestamp      = $tsNow
-    host           = $HostName
-    action         = 'list_scheduled_tasks'
-    copilot_action = $true
+    item          = 'verify_source'
+    sources       = @('Get-ScheduledTask','Get-ScheduledTaskInfo','TaskScheduler/Operational (wevtutil)')
+    events_filter = @{ LogName='Microsoft-Windows-TaskScheduler/Operational'; Id=@(200,201,203); StartTime=(Get-Date).AddDays(-7) }
+  }) )
+
+  [void]$lines.Add( (New-NdjsonLine @{
     item           = 'summary'
     task_count     = ($tasks | Measure-Object).Count
     events_loaded  = ($events | Measure-Object).Count
@@ -121,6 +124,11 @@ try{
     try { $info = Get-ScheduledTaskInfo -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop } catch {}
 
     $stateVal = if($info -and $info.State){ $info.State } elseif($task.State){ $task.State } else { 'Unknown' }
+
+    $author   = $null
+    $runLevel = $null
+    try { $author = $task.Author }   catch {}
+    try { $runLevel = $task.Principal.RunLevel } catch {}
 
     $triggerStrs = @()
     if ($task.Triggers) {
@@ -137,6 +145,7 @@ try{
         $triggerStrs += $desc
       }
     }
+
     $actionStrs = @()
     if ($task.Actions) {
       foreach ($a in $task.Actions) {
@@ -147,44 +156,45 @@ try{
       }
     }
 
+    $fullName = ($task.TaskPath + $task.TaskName)
+
     [void]$lines.Add( (New-NdjsonLine @{
-      timestamp        = $tsNow
-      host             = $HostName
-      action           = 'list_scheduled_tasks'
-      copilot_action   = $true
       item             = 'task'
       task_name        = $task.TaskName
+      full_name        = $fullName
       path             = $task.TaskPath
       state            = $stateVal
       last_run_time    = (To-ISO8601 ($info.LastRunTime))
       next_run_time    = (To-ISO8601 ($info.NextRunTime))
       last_task_result = $info.LastTaskResult
-      author           = $task.Author
-      run_level        = $task.Principal.RunLevel
+      author           = $author
+      run_level        = $runLevel
       triggers         = ($triggerStrs -join '; ')
       actions          = ($actionStrs  -join '; ')
     }) )
 
     try{
-      $taskFullName = $task.TaskPath + $task.TaskName
       $taskEvents = $events | Where-Object {
-        $_.Properties.Count -ge 2 -and $_.Properties[0].Value -eq $taskFullName
+        $_.Properties.Count -ge 2 -and $_.Properties[0].Value -eq $fullName
       } | Sort-Object TimeCreated -Descending | Select-Object -First 5
 
       foreach($ev in $taskEvents){
+        $result = $null
+        try { $result = $ev.Properties[1].Value } catch {}
         [void]$lines.Add( (New-NdjsonLine @{
-          timestamp      = (To-ISO8601 $ev.TimeCreated)
-          host           = $HostName
           action         = 'scheduled_task_history'
-          copilot_action = $true
           item           = 'history'
+          timestamp      = (To-ISO8601 $ev.TimeCreated)
           task_name      = $task.TaskName
+          full_name      = $fullName
           path           = $task.TaskPath
-          result         = $ev.Properties[1].Value
+          event_id       = $ev.Id
+          result         = $result
         }) )
       }
     }catch{
-      Write-Log "History load failed for $($task.TaskPath)$($task.TaskName): $($_.Exception.Message)" 'WARN'
+    Write-Log "History load failed for ${fullName}: $($_.Exception.Message)" 'WARN'
+
     }
   }
 
@@ -194,10 +204,6 @@ try{
 catch{
   Write-Log $_.Exception.Message 'ERROR'
   $err = New-NdjsonLine @{
-    timestamp      = (Get-Date).ToString('o')
-    host           = $HostName
-    action         = 'list_scheduled_tasks'
-    copilot_action = $true
     item           = 'error'
     error          = $_.Exception.Message
   }
