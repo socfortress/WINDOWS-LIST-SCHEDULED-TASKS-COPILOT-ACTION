@@ -1,26 +1,10 @@
 {
   "copilot_action_name": "WINDOWS-LIST-SCHEDULED-TASKS-COPILOT-ACTION",
-  "description": "Lists all Windows Scheduled Tasks with key properties (state, author, run level, triggers, actions) and emits NDJSON lines, plus up to 5 recent completion events per task from the Task Scheduler Operational log (last 7 days). Uses atomic overwrite of the Active Response log with .new fallback.",
+  "description": "Enumerates Windows Scheduled Tasks and emits NDJSON records with key properties (state, author, run level, triggers, actions, last/next run time, last result). Ensures the Task Scheduler Operational log is enabled and includes up to five recent history events (IDs 200, 201, 203) per task from the last seven days, along with verification and summary entries.",
   "technology": "Windows",
   "icon": "windows",
-  "script_parameters": [
-    {
-      "name": "LogPath",
-      "type": "string",
-      "required": false,
-      "description": "Path to the rotating human-readable script log.",
-      "default": "%TEMP%/ListScheduledTasks-script.log"
-    },
-    {
-      "name": "ARLog",
-      "type": "string",
-      "required": false,
-      "description": "Active Response NDJSON output path (atomic overwrite; falls back to .new if locked).",
-      "default": "C:\\Program Files (x86)\\ossec-agent\\active-response\\active-responses.log"
-    }
-  ],
-  "repo_url": "https://raw.githubusercontent.com/socfortress/WINDOWS-LIST-SCHEDULED-TASKS-COPILOT-ACTION/refs/heads/main",
+  "repo_url": "https://raw.githubusercontent.com/socfortress/WINDOWS-LIST-SCHEDULED-TASKS-COPILOT-ACTION/refs/heads/main/List-ScheduledTasks.ps1",
   "script_name": "List-ScheduledTasks.ps1",
   "version": "1.0.0",
-  "last_updated": "2025-08-22T00:00:00Z"
+  "last_updated": "2025-09-09T00:00:00Z"
 }
