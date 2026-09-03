@@ -24,6 +24,164 @@ function Write-Log {
   Add-Content -Path $LogPath -Value $line -Encoding utf8
 }
 
+function Convert-LegacyScheduledTask {
+  param($RegisteredTask)
+
+  $definition = $RegisteredTask.Definition
+
+  $taskPath = '\'
+  $fullPath = [string]$RegisteredTask.Path
+  $pos = $fullPath.LastIndexOf('\')
+
+  if ($pos -gt 0) {
+    $taskPath = $fullPath.Substring(0, $pos + 1)
+  }
+
+  $triggers = @()
+
+  try {
+    $collection = $definition.Triggers
+
+    for ($i = 1; $i -le $collection.Count; $i++) {
+      $t = $collection.Item($i)
+
+      $startBoundary = $null
+      try { $startBoundary = $t.StartBoundary } catch {}
+
+      $triggers += New-Object PSObject -Property @{
+        TriggerType  = Convert-LegacyTriggerType ([int]$t.Type)
+        StartBoundary = $startBoundary
+      }
+    }
+  } catch {}
+
+  $actions = @()
+
+  try {
+    $collection = $definition.Actions
+
+    for ($i = 1; $i -le $collection.Count; $i++) {
+      $a = $collection.Item($i)
+
+      # TASK_ACTION_EXEC
+      if ([int]$a.Type -eq 0) {
+        $actions += New-Object PSObject -Property @{
+          Execute   = $a.Path
+          Arguments = $a.Arguments
+        }
+      }
+    }
+  } catch {}
+
+  $author = $null
+  try { $author = $definition.RegistrationInfo.Author } catch {}
+
+  $runLevel = $null
+  try {
+    if ([int]$definition.Principal.RunLevel -eq 1) {
+      $runLevel = 'Highest'
+    } else {
+      $runLevel = 'Limited'
+    }
+  } catch {}
+
+  $lastRun = $null
+  $nextRun = $null
+  $lastResult = $null
+
+  try { $lastRun = [datetime]$RegisteredTask.LastRunTime } catch {}
+  try { $nextRun = [datetime]$RegisteredTask.NextRunTime } catch {}
+  try { $lastResult = $RegisteredTask.LastTaskResult } catch {}
+
+  $legacyInfo = New-Object PSObject -Property @{
+    LastRunTime    = $lastRun
+    NextRunTime    = $nextRun
+    LastTaskResult = $lastResult
+  }
+
+  $principal = New-Object PSObject -Property @{
+    RunLevel = $runLevel
+  }
+
+  New-Object PSObject -Property @{
+    TaskName   = $RegisteredTask.Name
+    TaskPath   = $taskPath
+    State      = Convert-LegacyTaskState ([int]$RegisteredTask.State)
+    Author     = $author
+    Principal  = $principal
+    Triggers   = $triggers
+    Actions    = $actions
+    LegacyInfo = $legacyInfo
+  }
+}
+
+function Get-LegacyTasksFromFolder {
+  param($Folder)
+
+  $result = @()
+
+  try {
+    # 1 = TASK_ENUM_HIDDEN
+    $tasks = $Folder.GetTasks(1)
+
+    for ($i = 1; $i -le $tasks.Count; $i++) {
+      $result += Convert-LegacyScheduledTask $tasks.Item($i)
+    }
+  } catch {}
+
+  try {
+    $folders = $Folder.GetFolders(0)
+
+    for ($i = 1; $i -le $folders.Count; $i++) {
+      $result += Get-LegacyTasksFromFolder $folders.Item($i)
+    }
+  } catch {}
+
+  return $result
+}
+
+function Get-LegacyScheduledTasks {
+  $service = New-Object -ComObject 'Schedule.Service'
+  $service.Connect()
+
+  $root = $service.GetFolder('\')
+
+  return @(Get-LegacyTasksFromFolder $root)
+}
+
+function Convert-LegacyTriggerType {
+  param([int]$Type)
+
+  switch ($Type) {
+    0  { 'Event' }
+    1  { 'Time' }
+    2  { 'Daily' }
+    3  { 'Weekly' }
+    4  { 'Monthly' }
+    5  { 'MonthlyDOW' }
+    6  { 'Idle' }
+    7  { 'Registration' }
+    8  { 'Boot' }
+    9  { 'Logon' }
+    11 { 'SessionStateChange' }
+    12 { 'Custom' }
+    default { "Type$Type" }
+  }
+}
+
+function Convert-LegacyTaskState {
+  param([int]$State)
+
+  switch ($State) {
+    0 { 'Unknown' }
+    1 { 'Disabled' }
+    2 { 'Queued' }
+    3 { 'Ready' }
+    4 { 'Running' }
+    default { 'Unknown' }
+  }
+}
+
 function Rotate-Log {
   if(Test-Path $LogPath -PathType Leaf){
     if((Get-Item $LogPath).Length/1KB -gt $LogMaxKB){
@@ -79,8 +237,32 @@ try{
   Ensure-TaskSchedulerOperationalLog
   Write-Log "Loading tasks..." 'INFO'
   $tasks = @()
-  try { $tasks = Get-ScheduledTask -ErrorAction Stop }
-  catch { Write-Log ("Get-ScheduledTask error: {0}" -f $_.Exception.Message) 'WARN' }
+  $legacyMode = $false
+
+  if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+
+    try {
+      $tasks = @(Get-ScheduledTask -ErrorAction Stop)
+    }
+    catch {
+      Write-Log ("Get-ScheduledTask error: {0}" -f $_.Exception.Message) 'WARN'
+    }
+
+  }
+  else {
+
+    $legacyMode = $true
+
+    Write-Log "Get-ScheduledTask unavailable. Using Task Scheduler COM compatibility mode." 'WARN'
+
+    try {
+      $tasks = @(Get-LegacyScheduledTasks)
+      Write-Log ("Loaded {0} task(s) using COM compatibility mode" -f $tasks.Count) 'INFO'
+    }
+    catch {
+      Write-Log ("Task Scheduler COM error: {0}" -f $_.Exception.Message) 'WARN'
+    }
+  }
 
   if($MaxTasks -gt 0 -and $tasks.Count -gt $MaxTasks){
     Write-Log ("Capping tasks from {0} to {1}" -f $tasks.Count, $MaxTasks) 'WARN'
@@ -99,6 +281,20 @@ try{
     Write-Log "Get-WinEvent failed: $($_.Exception.Message)" 'WARN'
   }
 
+  if ($legacyMode) {
+  $taskSources = @(
+    'Task Scheduler COM (Schedule.Service)',
+    'TaskScheduler/Operational (wevtutil)'
+  )
+  }
+  else {
+    $taskSources = @(
+      'Get-ScheduledTask',
+      'Get-ScheduledTaskInfo',
+      'TaskScheduler/Operational (wevtutil)'
+    )
+  }
+
   $tsNow = (Get-Date).ToString('o')
   $lines = New-Object System.Collections.ArrayList
 
@@ -109,7 +305,7 @@ try{
 
   [void]$lines.Add( (New-NdjsonLine @{
     item          = 'verify_source'
-    sources       = @('Get-ScheduledTask','Get-ScheduledTaskInfo','TaskScheduler/Operational (wevtutil)')
+    sources       = $taskSources
     events_filter = @{ LogName='Microsoft-Windows-TaskScheduler/Operational'; Id=@(200,201,203); StartTime=(Get-Date).AddDays(-7) }
   }) )
 
@@ -121,7 +317,19 @@ try{
 
   foreach($task in $tasks){
     $info = $null
-    try { $info = Get-ScheduledTaskInfo -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop } catch {}
+
+    if ($legacyMode) {
+      $info = $task.LegacyInfo
+    }
+    else {
+      try {
+        $info = Get-ScheduledTaskInfo `
+          -TaskName $task.TaskName `
+          -TaskPath $task.TaskPath `
+          -ErrorAction Stop
+      }
+      catch {}
+    }
 
     $stateVal = if($info -and $info.State){ $info.State } elseif($task.State){ $task.State } else { 'Unknown' }
 
